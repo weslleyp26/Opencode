@@ -1,0 +1,166 @@
+{
+  "name": "opencode-vscode",
+  "displayName": "OpenCode for VS Code",
+  "description": "OpenCode no VS Code: painel nativo (webview) conversando com o servidor OpenCode.",
+  "version": "0.1.1",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://example.invalid/opencode-vscode.git"
+  },
+  "engines": {
+    "vscode": "^1.94.0",
+    "node": ">=20"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "keywords": [
+    "opencode",
+    "ai",
+    "agent",
+    "chat"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "opencode.openSidebar",
+        "title": "OpenCode: Open Sidebar",
+        "category": "OpenCode",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "opencode.openPanel",
+        "title": "OpenCode: Open in New Tab",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode.newSession",
+        "title": "OpenCode: New Session",
+        "category": "OpenCode",
+        "icon": "$(plus)"
+      },
+      {
+        "command": "opencode.insertFileReference",
+        "title": "OpenCode: Insert File Reference",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode.restartServer",
+        "title": "OpenCode: Restart Server",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode.showLogs",
+        "title": "OpenCode: Show Logs",
+        "category": "OpenCode"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "opencode.openSidebar",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "opencode.insertFileReference",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "OpenCode",
+      "properties": {
+        "opencode.serverCommand": {
+          "type": "string",
+          "default": "opencode",
+          "scope": "machine",
+          "description": "Executável usado para iniciar o servidor OpenCode (use 'opencode' do PATH ou um caminho absoluto)."
+        },
+        "opencode.serverArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "4096"
+          ],
+          "scope": "machine",
+          "description": "Argumentos passados ao servidor OpenCode."
+        },
+        "opencode.autoStartServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Iniciar o servidor OpenCode automaticamente ao ativar a extensão."
+        },
+        "opencode.attachOpenFile": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Anexar o arquivo aberto no editor às mensagens enviadas."
+        },
+        "opencode.attachSelection": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Anexar a seleção do editor às mensagens enviadas."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencode-sidebar",
+          "title": "OpenCode",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencode-sidebar": [
+        {
+          "type": "webview",
+          "id": "opencode.chatView",
+          "name": "OpenCode"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "opencode.insertFileReference",
+          "group": "opencode@1",
+          "when": "resourceScheme == file"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "opencode.openPanel",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.94.0",
+    "typescript": "^5.4.0"
+  }
+}
