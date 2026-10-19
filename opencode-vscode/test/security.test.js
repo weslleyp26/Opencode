@@ -155,6 +155,22 @@ async function main() {
     const m = parseWebviewMessage({ type: "openFile", path: "src/app.ts", line: 10 });
     assert.deepStrictEqual(m, { type: "openFile", path: "src/app.ts", line: 10 });
   });
+  test("aceita 'abort', 'pickFile' e 'listSessions'", () => {
+    assert.deepStrictEqual(parseWebviewMessage({ type: "abort" }), { type: "abort" });
+    assert.deepStrictEqual(parseWebviewMessage({ type: "pickFile" }), { type: "pickFile" });
+    assert.deepStrictEqual(parseWebviewMessage({ type: "listSessions" }), { type: "listSessions" });
+  });
+  test("'restoreSession' só aceita ID de sessão com formato seguro", () => {
+    const ok = parseWebviewMessage({ type: "restoreSession", sessionId: "ses_abc-123" });
+    assert.deepStrictEqual(ok, { type: "restoreSession", sessionId: "ses_abc-123" });
+    assert.strictEqual(parseWebviewMessage({ type: "restoreSession" }), null);
+    assert.strictEqual(parseWebviewMessage({ type: "restoreSession", sessionId: "" }), null);
+    assert.strictEqual(parseWebviewMessage({ type: "restoreSession", sessionId: "../x" }), null);
+    assert.strictEqual(
+      parseWebviewMessage({ type: "restoreSession", sessionId: "a".repeat(129) }),
+      null
+    );
+  });
 
   console.log("\n#7 — randomNonce (nonce criptográfico)");
   test("gera nonces únicos e base64url", () => {

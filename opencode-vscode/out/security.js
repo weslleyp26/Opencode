@@ -97,7 +97,16 @@ function parseWebviewMessage(raw) {
         case "newSession":
         case "abort":
         case "insertReference":
+        case "pickFile":
+        case "listSessions":
             return { type: m.type };
+        case "restoreSession":
+            // ID vindo da webview: só caracteres de ID opencode (ex.: ses_xxxx),
+            // com limite de tamanho — nunca chega a path/URL sem esse formato.
+            return typeof m.sessionId === "string" &&
+                /^[A-Za-z0-9_-]{1,128}$/.test(m.sessionId)
+                ? { type: "restoreSession", sessionId: m.sessionId }
+                : null;
         case "send":
             return typeof m.text === "string" && m.text.length > 0 && m.text.length <= 1_000_000
                 ? { type: "send", text: m.text }

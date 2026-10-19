@@ -20,12 +20,33 @@ export interface ServerInfo {
   owned: boolean;
 }
 
+/**
+ * Estado da conexão com o servidor, espelhado na UI do webview:
+ *   starting -> "conectando…", online -> "online", offline -> "offline".
+ * Publicado via `onStateChange` para que a UI nunca fique presa num estado
+ * antigo (o webview só consultava `current` uma vez, ao enviar `ready`).
+ */
+export type ConnectionState = "starting" | "online" | "offline";
+
 /** Evento cru do stream SSE (`GET /api/event`). */
 export interface BusEvent {
   id: string;
   type: string;
   created?: number;
   data: Record<string, unknown>;
+}
+
+/** Resumo de sessão vindo de `GET /session` (histórico). */
+export interface SessionSummary {
+  id: string;
+  title: string | null;
+  updated: number | null;
+}
+
+/** Mensagem simplificada de uma sessão (`GET /session/:id/message`). */
+export interface SessionMessage {
+  role: "user" | "assistant";
+  text: string;
 }
 
 /**
@@ -46,6 +67,9 @@ export class ServerManager {
   private starting: Promise<ServerInfo> | null = null;
   private eventAbort: AbortController | null = null;
   private listeners = new Set<(e: BusEvent) => void>();
+  /** Estado da conexão espelhado para a UI. */
+  private state: ConnectionState = "offline";
+  private stateListeners = new Set<(s: ConnectionState) => void>();
   /** Última senha usada, para tentar novamente após restart. */
   private password: string | null = null;
 
@@ -55,16 +79,47 @@ export class ServerManager {
     return this.info;
   }
 
+  get connectionState(): ConnectionState {
+    return this.state;
+  }
+
   onEvent(fn: (e: BusEvent) => void): vscode.Disposable {
     this.listeners.add(fn);
     return { dispose: () => this.listeners.delete(fn) };
   }
 
+  /** Notifica a UI sempre que a conexão muda (início, pronta, queda, stop). */
+  onStateChange(fn: (s: ConnectionState) => void): vscode.Disposable {
+    this.stateListeners.add(fn);
+    return { dispose: () => this.stateListeners.delete(fn) };
+  }
+
+  private setState(state: ConnectionState): void {
+    if (this.state === state) return;
+    this.state = state;
+    for (const fn of this.stateListeners) fn(state);
+  }
+
+  /** Atribui `info` e publica o estado correspondente (online/offline). */
+  private setInfo(info: ServerInfo | null): void {
+    this.info = info;
+    this.setState(info ? "online" : "offline");
+  }
+
   async start(): Promise<ServerInfo> {
     if (this.info) return this.info;
     if (this.starting) return this.starting;
-    this.starting = this.doStart().finally(() => (this.starting = null));
-    return this.starting;
+    this.setState("starting");
+    const pending = this.doStart().finally(() => (this.starting = null));
+    this.starting = pending;
+    try {
+      return await pending;
+    } catch (err) {
+      // Falha (spawn, timeout, anexação recusada): a UI precisa sair de
+      // "conectando…" e mostrar o estado real.
+      this.setState("offline");
+      throw err;
+    }
   }
 
   private async doStart(): Promise<ServerInfo> {
@@ -120,7 +175,7 @@ export class ServerManager {
     child.stderr.on("data", (d: Buffer) => this.log.append(d.toString()));
     child.on("exit", (code) => {
       this.log.appendLine(`[server] saiu com código ${code}`);
-      if (this.info?.process === child) this.info = null;
+      if (this.info?.process === child) this.setInfo(null);
     });
 
     await this.waitForReady(baseUrl, password);
@@ -137,15 +192,16 @@ export class ServerManager {
       throw new Error(`servidor em ${baseUrl} não é confiável (${ownership.detail})`);
     }
 
-    this.info = {
+    const info: ServerInfo = {
       baseUrl,
       authHeader: password ? basicHeader("opencode", password) : null,
       process: child,
       owned: true,
     };
+    this.setInfo(info);
     this.log.appendLine(`[server] pronto em ${baseUrl}`);
     void this.pumpEvents();
-    return this.info;
+    return info;
   }
 
   /**
@@ -173,9 +229,10 @@ export class ServerManager {
     if (kind === "open") {
       // Servidor sem auth: anexa sem enviar nenhum segredo.
       this.log.appendLine(`[server] conectado a servidor existente (sem auth) em ${baseUrl}`);
-      this.info = { baseUrl, authHeader: null, process: null, owned: false };
+      const info: ServerInfo = { baseUrl, authHeader: null, process: null, owned: false };
+      this.setInfo(info);
       void this.pumpEvents();
-      return this.info;
+      return info;
     }
 
     // Servidor exige auth: tenta credenciais locais. `tryCredentials`
@@ -189,14 +246,15 @@ export class ServerManager {
       const result = await tryCredentials(baseUrl, basicHeader("opencode", candidate));
       if (result.ok) {
         this.log.appendLine(`[server] anexado com credencial local em ${baseUrl}`);
-        this.info = {
+        const info: ServerInfo = {
           baseUrl,
           authHeader: basicHeader("opencode", candidate),
           process: null,
           owned: false,
         };
+        this.setInfo(info);
         void this.pumpEvents();
-        return this.info;
+        return info;
       }
       this.log.appendLine(`[server] credencial local recusada (${result.reason})`);
     }
@@ -262,6 +320,87 @@ export class ServerManager {
     const id = body.data?.id;
     if (!id) throw new Error("createSession: resposta sem id");
     return id;
+  }
+
+  /**
+   * Aborta a execução em andamento da sessão.
+   * Contrato v2 verificado ao vivo: POST /session/:id/interrupt -> { interrupted }
+   * (o antigo `/abort` da doc v1 responde 404 neste servidor).
+   */
+  async abortSession(sessionId: string): Promise<void> {
+    const info = await this.start();
+    const res = await fetch(`${info.baseUrl}/api/session/${sessionId}/interrupt`, {
+      method: "POST",
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) throw new Error(`interrupt falhou: HTTP ${res.status}`);
+  }
+
+  /**
+   * Lista as sessões existentes no servidor (histórico).
+   * Contrato: GET /session -> { data: Session[] }.
+   */
+  async listSessions(): Promise<SessionSummary[]> {
+    const info = await this.start();
+    const res = await fetch(`${info.baseUrl}/api/session`, {
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) throw new Error(`listSessions falhou: HTTP ${res.status}`);
+    const body = (await res.json()) as { data?: Array<Record<string, unknown>> };
+    const raw = Array.isArray(body.data) ? body.data : [];
+    return raw
+      .filter((s) => typeof s.id === "string")
+      .map((s) => ({
+        id: s.id as string,
+        title: typeof s.title === "string" && s.title.trim() ? s.title.trim() : null,
+        updated:
+          typeof (s.time as Record<string, unknown> | undefined)?.updated === "number"
+            ? ((s.time as { updated: number }).updated)
+            : typeof s.updated === "number"
+              ? s.updated
+              : null,
+      }))
+      .sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0));
+  }
+
+  /**
+   * Carrega o histórico de mensagens de uma sessão para restaurar a UI.
+   * Contrato v2 verificado ao vivo:
+   *   GET /session/:id/message -> { data: [{ type: "user"|"assistant",
+   *                                          content: [{ type: "text", text }] }] }
+   * Também aceita o formato antigo `{ info: { role }, parts }` por robustez.
+   */
+  async getMessages(sessionId: string): Promise<SessionMessage[]> {
+    const info = await this.start();
+    const res = await fetch(`${info.baseUrl}/api/session/${sessionId}/message`, {
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) throw new Error(`getMessages falhou: HTTP ${res.status}`);
+    const body = (await res.json()) as {
+      data?: Array<
+        | {
+            type?: string;
+            content?: Array<{ type?: string; text?: string }>;
+            info?: { role?: string };
+            parts?: Array<{ type?: string; text?: string }>;
+          }
+        | undefined
+      >;
+    };
+    const raw = Array.isArray(body.data) ? body.data : [];
+    const out: SessionMessage[] = [];
+    for (const msg of raw) {
+      if (!msg) continue;
+      const role = msg.info?.role ?? msg.type;
+      if (role !== "user" && role !== "assistant") continue;
+      const parts = msg.content ?? msg.parts ?? [];
+      const text = parts
+        .filter((p) => p.type === "text" && typeof p.text === "string")
+        .map((p) => p.text)
+        .join("");
+      if (text) out.push({ role, text });
+    }
+    return out;
   }
 
   /** Envia um prompt. O retorno é imediato; o texto vem pelo SSE. */
@@ -343,7 +482,7 @@ export class ServerManager {
     this.eventAbort?.abort();
     this.eventAbort = null;
     const proc = this.info?.process;
-    this.info = null;
+    this.setInfo(null);
     if (!proc) return;
     this.log.appendLine("[server] encerrando");
     proc.kill();

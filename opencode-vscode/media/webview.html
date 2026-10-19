@@ -170,6 +170,12 @@
   }
   #send:hover { background: var(--vscode-button-hoverBackground); }
   #send:disabled { opacity: .35; cursor: default; }
+  /* modo "parar" (ESC): o botão de envio vira um botão de abortar */
+  #send.stop {
+    background: var(--vscode-errorForeground, #e51400);
+    color: var(--vscode-button-foreground, #fff);
+  }
+  #send.stop:hover { filter: brightness(1.15); }
 
   @media (max-width: 340px) { .hint { display: none; } }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -205,9 +211,10 @@
     <div id="ctxBadge" class="ctx-badge" hidden></div>
     <textarea id="input" rows="1" placeholder="Pergunte ao OpenCode…"></textarea>
     <div class="toolbar">
-      <button class="icon" id="ref" title="Inserir referência @arquivo (Ctrl+Alt+K)">@</button>
+      <button class="icon" id="ref" title="Anexar arquivo com @ (abre o seletor de arquivos)">@</button>
       <button class="icon" id="new" title="Nova sessão">＋</button>
-      <span class="hint">Enter envia · Shift+Enter quebra linha</span>
+      <button class="icon" id="history" title="Histórico de sessões — voltar para uma conversa anterior">🕘</button>
+      <span class="hint">Enter envia · Shift+Enter quebra linha · Esc interrompe</span>
       <span class="status" id="status" title=""><span class="dot" id="dot"></span><span id="statusText">conectando…</span></span>
       <button id="send" title="Enviar (Enter)" disabled>↑</button>
     </div>
@@ -232,6 +239,7 @@
     let pinned = true;         // rolagem automática só quando o usuário está no fim
     let online = null;
     let sessionId = null;
+    let busy = false;          // execução em andamento (mostra o botão parar/ESC)
 
     // --------------------------------------------------------- markdown
     const esc = (s) => s.replace(/[&<>"']/g, (c) => (
@@ -335,13 +343,37 @@
     }
 
     // ----------------------------------------------------------- composer
+    function updateSendButton() {
+      if (busy) {
+        sendBtn.classList.add('stop');
+        sendBtn.textContent = '■';
+        sendBtn.title = 'Parar (Esc)';
+        sendBtn.disabled = false;
+      } else {
+        sendBtn.classList.remove('stop');
+        sendBtn.textContent = '↑';
+        sendBtn.title = 'Enviar (Enter)';
+        sendBtn.disabled = input.value.trim().length === 0;
+      }
+    }
+    function setBusy(value) {
+      busy = !!value;
+      updateSendButton();
+    }
+
     const resize = () => {
       input.style.height = 'auto';
       input.style.height = Math.min(input.scrollHeight, 170) + 'px';
-      sendBtn.disabled = input.value.trim().length === 0;
+      updateSendButton();
+    };
+
+    const abortRun = () => {
+      vscode.postMessage({ type: 'abort' });
+      setBusy(false);   // feedback imediato; o host confirma depois
     };
 
     const send = () => {
+      if (busy) { abortRun(); return; }
       const text = input.value.trim();
       if (!text) return;
       addUser(text);
@@ -354,6 +386,12 @@
     sendBtn.addEventListener('click', send);
     input.addEventListener('input', resize);
     input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && busy) {
+        // Esc interrompe a execução em andamento (como no TUI do OpenCode).
+        e.preventDefault();
+        abortRun();
+        return;
+      }
       if (e.key !== 'Enter' || e.isComposing) return;
       if (e.shiftKey) return;          // Shift+Enter: quebra de linha (comporta como Enter)
       e.preventDefault();               // Enter (ou Ctrl+Enter): envia
@@ -364,6 +402,9 @@
       clearConversation();
       vscode.postMessage({ type: 'newSession' });
       input.focus();
+    });
+    document.getElementById('history').addEventListener('click', () => {
+      vscode.postMessage({ type: 'listSessions' });
     });
     document.getElementById('ref').addEventListener('click', () =>
       vscode.postMessage({ type: 'insertReference' })
@@ -381,7 +422,11 @@
       const m = e.data;
       switch (m.type) {
         case 'server':
-          online = !!m.baseUrl;
+          // `state` ('online' | 'starting' | 'offline') é enviado no `ready`
+          // e a cada mudança de conexão; `baseUrl` fica como fallback antigo.
+          online = m.state
+            ? (m.state === 'online' ? true : m.state === 'starting' ? null : false)
+            : !!m.baseUrl;
           if (m.sessionId) sessionId = String(m.sessionId);
           updateStatus();
           break;
@@ -401,6 +446,19 @@
               ctx.textContent = '';
             }
           }
+          break;
+        }
+        case 'reference:insert': {
+          // Botão `@`: insere `@arquivo` na mensagem (composer) no cursor.
+          const ref = String(m.text || '');
+          if (!ref) break;
+          const start = input.selectionStart ?? input.value.length;
+          const end = input.selectionEnd ?? start;
+          input.value = input.value.slice(0, start) + ref + input.value.slice(end);
+          const pos = start + ref.length;
+          input.setSelectionRange(pos, pos);
+          resize();
+          input.focus();
           break;
         }
         case 'text:delta':
@@ -449,19 +507,45 @@
           break;
         }
         case 'exec:start':
+          setBusy(true);
           thinking.classList.add('on');
           autoScroll();
           break;
         case 'exec:end':
+          setBusy(false);
           thinking.classList.remove('on');
           break;
         case 'error':
+          setBusy(false);
           thinking.classList.remove('on');
           addError('erro: ' + m.text);
           break;
         case 'session:new':
           clearConversation();
+          setBusy(false);
+          sessionId = null;
+          updateStatus();
           break;
+        case 'session:restore': {
+          // Histórico: reconstrói a conversa a partir das mensagens do servidor.
+          clearConversation();
+          setBusy(false);
+          sessionId = m.sessionId ? String(m.sessionId) : sessionId;
+          updateStatus();
+          for (const msg of Array.isArray(m.messages) ? m.messages : []) {
+            if (msg.role === 'user') {
+              addUser(String(msg.text || ''));
+            } else if (msg.role === 'assistant') {
+              const content = startAssistant();
+              content.innerHTML = md(String(msg.text || ''));
+              current = null; currentText = '';
+            }
+          }
+          welcome.hidden = msgs.children.length > 0;
+          pinned = true; scroll();
+          input.focus();
+          break;
+        }
         case 'focus':
           input.focus();
           break;

@@ -61,6 +61,9 @@ class ServerManager {
     starting = null;
     eventAbort = null;
     listeners = new Set();
+    /** Estado da conexão espelhado para a UI. */
+    state = "offline";
+    stateListeners = new Set();
     /** Última senha usada, para tentar novamente após restart. */
     password = null;
     constructor(log) {
@@ -69,17 +72,47 @@ class ServerManager {
     get current() {
         return this.info;
     }
+    get connectionState() {
+        return this.state;
+    }
     onEvent(fn) {
         this.listeners.add(fn);
         return { dispose: () => this.listeners.delete(fn) };
+    }
+    /** Notifica a UI sempre que a conexão muda (início, pronta, queda, stop). */
+    onStateChange(fn) {
+        this.stateListeners.add(fn);
+        return { dispose: () => this.stateListeners.delete(fn) };
+    }
+    setState(state) {
+        if (this.state === state)
+            return;
+        this.state = state;
+        for (const fn of this.stateListeners)
+            fn(state);
+    }
+    /** Atribui `info` e publica o estado correspondente (online/offline). */
+    setInfo(info) {
+        this.info = info;
+        this.setState(info ? "online" : "offline");
     }
     async start() {
         if (this.info)
             return this.info;
         if (this.starting)
             return this.starting;
-        this.starting = this.doStart().finally(() => (this.starting = null));
-        return this.starting;
+        this.setState("starting");
+        const pending = this.doStart().finally(() => (this.starting = null));
+        this.starting = pending;
+        try {
+            return await pending;
+        }
+        catch (err) {
+            // Falha (spawn, timeout, anexação recusada): a UI precisa sair de
+            // "conectando…" e mostrar o estado real.
+            this.setState("offline");
+            throw err;
+        }
     }
     async doStart() {
         const cfg = vscode.workspace.getConfiguration("opencode");
@@ -130,7 +163,7 @@ class ServerManager {
         child.on("exit", (code) => {
             this.log.appendLine(`[server] saiu com código ${code}`);
             if (this.info?.process === child)
-                this.info = null;
+                this.setInfo(null);
         });
         await this.waitForReady(baseUrl, password);
         // #1: verificação de posse — se outro processo tomou a porta antes do
@@ -141,15 +174,16 @@ class ServerManager {
             child.kill();
             throw new Error(`servidor em ${baseUrl} não é confiável (${ownership.detail})`);
         }
-        this.info = {
+        const info = {
             baseUrl,
             authHeader: password ? (0, security_1.basicHeader)("opencode", password) : null,
             process: child,
             owned: true,
         };
+        this.setInfo(info);
         this.log.appendLine(`[server] pronto em ${baseUrl}`);
         void this.pumpEvents();
-        return this.info;
+        return info;
     }
     /**
      * Anexa a um servidor que já responde na porta. Exige confirmação
@@ -167,9 +201,10 @@ class ServerManager {
         if (kind === "open") {
             // Servidor sem auth: anexa sem enviar nenhum segredo.
             this.log.appendLine(`[server] conectado a servidor existente (sem auth) em ${baseUrl}`);
-            this.info = { baseUrl, authHeader: null, process: null, owned: false };
+            const info = { baseUrl, authHeader: null, process: null, owned: false };
+            this.setInfo(info);
             void this.pumpEvents();
-            return this.info;
+            return info;
         }
         // Servidor exige auth: tenta credenciais locais. `tryCredentials`
         // primeiro verifica que ele rejeita senhas erradas (anti-coleta).
@@ -182,14 +217,15 @@ class ServerManager {
             const result = await (0, security_1.tryCredentials)(baseUrl, (0, security_1.basicHeader)("opencode", candidate));
             if (result.ok) {
                 this.log.appendLine(`[server] anexado com credencial local em ${baseUrl}`);
-                this.info = {
+                const info = {
                     baseUrl,
                     authHeader: (0, security_1.basicHeader)("opencode", candidate),
                     process: null,
                     owned: false,
                 };
+                this.setInfo(info);
                 void this.pumpEvents();
-                return this.info;
+                return info;
             }
             this.log.appendLine(`[server] credencial local recusada (${result.reason})`);
         }
@@ -249,6 +285,79 @@ class ServerManager {
         if (!id)
             throw new Error("createSession: resposta sem id");
         return id;
+    }
+    /**
+     * Aborta a execução em andamento da sessão.
+     * Contrato v2 verificado ao vivo: POST /session/:id/interrupt -> { interrupted }
+     * (o antigo `/abort` da doc v1 responde 404 neste servidor).
+     */
+    async abortSession(sessionId) {
+        const info = await this.start();
+        const res = await fetch(`${info.baseUrl}/api/session/${sessionId}/interrupt`, {
+            method: "POST",
+            headers: this.authHeaders(),
+        });
+        if (!res.ok)
+            throw new Error(`interrupt falhou: HTTP ${res.status}`);
+    }
+    /**
+     * Lista as sessões existentes no servidor (histórico).
+     * Contrato: GET /session -> { data: Session[] }.
+     */
+    async listSessions() {
+        const info = await this.start();
+        const res = await fetch(`${info.baseUrl}/api/session`, {
+            headers: this.authHeaders(),
+        });
+        if (!res.ok)
+            throw new Error(`listSessions falhou: HTTP ${res.status}`);
+        const body = (await res.json());
+        const raw = Array.isArray(body.data) ? body.data : [];
+        return raw
+            .filter((s) => typeof s.id === "string")
+            .map((s) => ({
+            id: s.id,
+            title: typeof s.title === "string" && s.title.trim() ? s.title.trim() : null,
+            updated: typeof s.time?.updated === "number"
+                ? (s.time.updated)
+                : typeof s.updated === "number"
+                    ? s.updated
+                    : null,
+        }))
+            .sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0));
+    }
+    /**
+     * Carrega o histórico de mensagens de uma sessão para restaurar a UI.
+     * Contrato v2 verificado ao vivo:
+     *   GET /session/:id/message -> { data: [{ type: "user"|"assistant",
+     *                                          content: [{ type: "text", text }] }] }
+     * Também aceita o formato antigo `{ info: { role }, parts }` por robustez.
+     */
+    async getMessages(sessionId) {
+        const info = await this.start();
+        const res = await fetch(`${info.baseUrl}/api/session/${sessionId}/message`, {
+            headers: this.authHeaders(),
+        });
+        if (!res.ok)
+            throw new Error(`getMessages falhou: HTTP ${res.status}`);
+        const body = (await res.json());
+        const raw = Array.isArray(body.data) ? body.data : [];
+        const out = [];
+        for (const msg of raw) {
+            if (!msg)
+                continue;
+            const role = msg.info?.role ?? msg.type;
+            if (role !== "user" && role !== "assistant")
+                continue;
+            const parts = msg.content ?? msg.parts ?? [];
+            const text = parts
+                .filter((p) => p.type === "text" && typeof p.text === "string")
+                .map((p) => p.text)
+                .join("");
+            if (text)
+                out.push({ role, text });
+        }
+        return out;
     }
     /** Envia um prompt. O retorno é imediato; o texto vem pelo SSE. */
     async prompt(sessionId, text) {
@@ -329,7 +438,7 @@ class ServerManager {
         this.eventAbort?.abort();
         this.eventAbort = null;
         const proc = this.info?.process;
-        this.info = null;
+        this.setInfo(null);
         if (!proc)
             return;
         this.log.appendLine("[server] encerrando");

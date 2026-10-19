@@ -42,7 +42,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly server: ServerManager
   ) {
     this.disposables.push(
-      this.server.onEvent((e) => this.onBusEvent(e))
+      this.server.onEvent((e) => this.onBusEvent(e)),
+      // A UI lê o estado do servidor em `ready` e TAMBÉM a cada mudança:
+      // sem isso o indicador ficava preso em "offline" quando a conexão
+      // ficava pronta depois do webview carregar (spawn/modal de anexação).
+      this.server.onStateChange(() => this.post(this.serverStatus()))
     );
   }
 
@@ -99,6 +103,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.panel?.webview.postMessage(message);
   }
 
+  /**
+   * Mensagem de estado do servidor para a webview: `state` é a fonte da
+   * verdade do indicador (online/conectando…/offline); `baseUrl` fica como
+   * compatibilidade com o formato antigo.
+   */
+  private serverStatus(): {
+    type: "server";
+    state: "starting" | "online" | "offline";
+    baseUrl: string | null;
+    sessionId: string | null;
+  } {
+    return {
+      type: "server",
+      state: this.server.connectionState,
+      baseUrl: this.server.current?.baseUrl ?? null,
+      sessionId: this.sessionId,
+    };
+  }
+
+  /** Inicia uma nova sessão (a anterior continua no servidor, no histórico). */
+  newSession(): void {
+    this.sessionId = null;
+    this.post({ type: "session:new" });
+  }
+
   dispose(): void {
     for (const d of this.disposables) d.dispose();
   }
@@ -137,6 +166,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "session.execution.succeeded":
         this.post({ type: "exec:end", ok: true });
         break;
+      case "session.execution.aborted":
+        this.post({ type: "exec:end", ok: false, aborted: true });
+        break;
       case "session.execution.failed":
         this.post({ type: "exec:end", ok: false });
         break;
@@ -155,30 +187,149 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ): Promise<void> {
     switch (message.type) {
       case "ready":
-        target.postMessage({
-          type: "server",
-          baseUrl: this.server.current?.baseUrl ?? null,
-          sessionId: this.sessionId,
-        });
+        target.postMessage(this.serverStatus());
         break;
       case "newSession":
-        this.sessionId = null;
-        target.postMessage({ type: "session:new" });
+        this.newSession();
         break;
       case "send":
         await this.handleSend(message.text ?? "", target);
         break;
       case "abort":
-        // `abort` da sessão está no servidor; aqui apenas liberamos a UI.
-        target.postMessage({ type: "exec:end", ok: false });
+        await this.handleAbort(target);
         break;
-      case "insertReference":
-        await vscode.commands.executeCommand("opencode.insertFileReference");
+      case "pickFile":
+        await this.handlePickFile(target);
         break;
+      case "listSessions":
+        await this.handleListSessions(target);
+        break;
+      case "restoreSession":
+        await this.handleRestoreSession(message.sessionId ?? "", target);
+        break;
+      case "insertReference": {
+        // O botão `@` do webview insere a referência no COMPOSER (na mensagem),
+        // não no editor: o foco está no webview, então o comando `type` não
+        // teria alvo. Abre um seletor de arquivos do workspace (com o arquivo
+        // ativo no topo) para anexar QUALQUER arquivo, não só o já aberto.
+        await this.handlePickFile(target, this.activeFileReference());
+        break;
+      }
       case "openFile":
         // #4: caminho já validado por parseWebviewMessage/isPathInsideWorkspace.
         await this.openFile(message.path, message.line);
         break;
+    }
+  }
+
+  /**
+   * Aborta a execução em andamento NO SERVIDOR (POST /session/:id/interrupt).
+   * O botão de parar da UI dispara isso; a UI é liberada ao chegar o
+   * evento `session.execution.aborted`/`succeeded` pelo SSE, com fallback
+   * imediato para não deixar a UI travada.
+   */
+  private async handleAbort(target: vscode.Webview): Promise<void> {
+    if (!this.sessionId) {
+      target.postMessage({ type: "exec:end", ok: false });
+      return;
+    }
+    try {
+      await this.server.abortSession(this.sessionId);
+    } catch (err) {
+      target.postMessage({ type: "error", text: `abort: ${String(err)}` });
+    }
+    target.postMessage({ type: "exec:end", ok: false });
+  }
+
+  /**
+   * Seletor de arquivos do workspace (estilo TUI do OpenCode): abre um
+   * QuickPick com os arquivos do projeto e devolve o escolhido para o
+   * webview inserir como `@arquivo` no composer.
+   */
+  private async handlePickFile(
+    target: vscode.Webview,
+    preferred?: string | null
+  ): Promise<void> {
+    const exclude =
+      "{**/node_modules/**,**/.git/**,**/out/**,**/dist/**,**/.vscode-test/**}";
+    const uris = await vscode.workspace.findFiles("**/*", exclude, 500);
+    if (uris.length === 0) {
+      target.postMessage({
+        type: "error",
+        text: "Nenhum arquivo encontrado no workspace.",
+      });
+      return;
+    }
+    const rel = (u: vscode.Uri) => vscode.workspace.asRelativePath(u);
+    const preferredRel = preferred?.replace(/^@/, "") ?? null;
+    const items = uris
+      .map((u) => rel(u))
+      .sort((a, b) => {
+        // arquivo ativo sempre primeiro
+        if (preferredRel) {
+          if (a === preferredRel) return -1;
+          if (b === preferredRel) return 1;
+        }
+        return a.localeCompare(b);
+      })
+      .map((r) => ({
+        label: r,
+        description: r === preferredRel ? "@arquivo (aberto)" : "@arquivo",
+      }));
+    const pick = await vscode.window.showQuickPick(items, {
+      placeHolder: "Escolha um arquivo para anexar com @ (digite para filtrar)",
+      matchOnDescription: true,
+    });
+    if (pick) target.postMessage({ type: "reference:insert", text: `@${pick.label}` });
+  }
+
+  /** Lista as sessões do servidor e deixa o usuário voltar para uma delas. */
+  private async handleListSessions(target: vscode.Webview): Promise<void> {
+    try {
+      const sessions = await this.server.listSessions();
+      if (sessions.length === 0) {
+        target.postMessage({
+          type: "error",
+          text: "Nenhuma sessão anterior encontrada no servidor.",
+        });
+        return;
+      }
+      const items = sessions.map((s) => ({
+        label: s.title ?? "(sem título)",
+        description: s.updated
+          ? new Date(s.updated).toLocaleString()
+          : "",
+        detail: s.id === this.sessionId ? "sessão atual" : s.id,
+        sid: s.id,
+      }));
+      const pick = await vscode.window.showQuickPick(items, {
+        placeHolder: "Voltar para uma sessão anterior",
+        matchOnDescription: true,
+      });
+      if (!pick) return;
+      this.sessionId = pick.sid;
+      const messages = await this.server.getMessages(pick.sid);
+      target.postMessage({
+        type: "session:restore",
+        sessionId: pick.sid,
+        messages,
+      });
+    } catch (err) {
+      target.postMessage({ type: "error", text: String(err) });
+    }
+  }
+
+  /** Restaura uma sessão escolhida na lista (histórico). */
+  private async handleRestoreSession(
+    sessionId: string,
+    target: vscode.Webview
+  ): Promise<void> {
+    try {
+      this.sessionId = sessionId;
+      const messages = await this.server.getMessages(sessionId);
+      target.postMessage({ type: "session:restore", sessionId, messages });
+    } catch (err) {
+      target.postMessage({ type: "error", text: String(err) });
     }
   }
 
@@ -222,6 +373,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       editor.selection = new vscode.Selection(pos, pos);
       editor.revealRange(new vscode.Range(pos, pos));
     }
+  }
+
+  /** Caminho relativo do arquivo ativo no formato `@arquivo` (ou null). */
+  private activeFileReference(): string | null {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return null;
+    return `@${vscode.workspace.asRelativePath(editor.document.uri)}`;
   }
 
   /**

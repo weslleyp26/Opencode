@@ -27,7 +27,7 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("opencode.openPanel", () => provider.openPanel()),
     vscode.commands.registerCommand("opencode.newSession", () => {
-      provider.post({ type: "session:new" });
+      provider.newSession();
       vscode.commands.executeCommand(`${ChatViewProvider.viewType}.focus`);
     }),
     vscode.commands.registerCommand("opencode.restartServer", async () => {
@@ -40,9 +40,16 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("opencode.insertFileReference", async () => {
       const editor = vscode.window.activeTextEditor;
-      if (!editor) return;
+      if (!editor) {
+        vscode.window.showWarningMessage(
+          "OpenCode: abra um arquivo para inserir a referência @."
+        );
+        return;
+      }
       const rel = vscode.workspace.asRelativePath(editor.document.uri);
-      await vscode.commands.executeCommand("type", { text: `@${rel}` });
+      // editor.edit insere direto no cursor do documento — ao contrário do
+      // comando `type`, que depende do foco no editor e falha silenciosamente.
+      await editor.edit((eb) => eb.insert(editor.selection.active, `@${rel}`));
     }),
     vscode.commands.registerCommand("opencode.showLogs", () => log.show(true))
   );
