@@ -41,6 +41,7 @@ const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const node_os_1 = require("node:os");
 const node_crypto_1 = require("node:crypto");
+const security_1 = require("./security");
 /**
  * Gerencia o servidor OpenCode e o canal de eventos.
  *
@@ -49,6 +50,10 @@ const node_crypto_1 = require("node:crypto");
  *   POST /api/session/:id/prompt {text}  -> 202-ish, assíncrono
  *   GET  /api/event                      -> text/event-stream (eventos do bus)
  *   auth: HTTP Basic (OPENCODE_PASSWORD / service.json)
+ *
+ * Segurança (#1): nunca envia credenciais a um servidor que não provou
+ * exigir autenticação; anexar a servidor existente exige confirmação
+ * explícita do usuário; após spawn próprio, verifica posse da porta.
  */
 class ServerManager {
     log;
@@ -86,15 +91,22 @@ class ServerManager {
             "--port",
             "4096",
         ]);
+        // #3: bloqueia command injection via config antes de qualquer spawn.
+        const cfgError = (0, security_1.validateCommandConfig)(command, args);
+        if (cfgError) {
+            this.log.appendLine(`[server] configuração rejeitada: ${cfgError}`);
+            throw new Error(`configuração do servidor rejeitada: ${cfgError}`);
+        }
         const port = this.extractPort(args) ?? 4096;
         const baseUrl = `http://127.0.0.1:${port}`;
-        // Se já há um servidor respondendo, apenas conecta (padrão "attach").
-        const existing = await this.probe(baseUrl);
-        if (existing.ok) {
-            this.log.appendLine(`[server] conectado a servidor existente em ${baseUrl}`);
-            this.info = { baseUrl, authHeader: existing.authHeader, process: null, owned: false };
-            void this.pumpEvents();
-            return this.info;
+        // #1: sonda ANÔNIMA. Um servidor que responde 200 sem autenticação pode
+        // ser um impostor coletor de credenciais; nunca enviamos senha a ele.
+        const probe = await (0, security_1.probeUnauthenticated)(baseUrl);
+        if (probe.kind === "open" || probe.kind === "auth-required") {
+            return await this.attachToExisting(baseUrl, probe.kind);
+        }
+        if (probe.kind === "other") {
+            throw new Error(`porta ${port} respondeu inesperadamente (HTTP ${probe.status})`);
         }
         const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         // A senha do service.json pertence ao SERVIÇO EM BACKGROUND e é rejeitada
@@ -121,15 +133,67 @@ class ServerManager {
                 this.info = null;
         });
         await this.waitForReady(baseUrl, password);
+        // #1: verificação de posse — se outro processo tomou a porta antes do
+        // nosso filho binde, ele não exigirá auth => abortamos e matamos o filho.
+        const ownership = await (0, security_1.verifyServerEnforcesAuth)(baseUrl, (0, security_1.basicHeader)("opencode", password));
+        if (!ownership.owned) {
+            this.log.appendLine(`[server] posse da porta falhou: ${ownership.detail}`);
+            child.kill();
+            throw new Error(`servidor em ${baseUrl} não é confiável (${ownership.detail})`);
+        }
         this.info = {
             baseUrl,
-            authHeader: password ? basicAuth("opencode", password) : null,
+            authHeader: password ? (0, security_1.basicHeader)("opencode", password) : null,
             process: child,
             owned: true,
         };
         this.log.appendLine(`[server] pronto em ${baseUrl}`);
         void this.pumpEvents();
         return this.info;
+    }
+    /**
+     * Anexa a um servidor que já responde na porta. Exige confirmação
+     * explícita do usuário (#1) e só envia credenciais armazenadas quando
+     * o servidor demonstrou exigir autenticação.
+     */
+    async attachToExisting(baseUrl, kind) {
+        const choice = await vscode.window.showWarningMessage(`OpenCode: já existe um servidor respondendo em ${baseUrl} ` +
+            (kind === "open"
+                ? "(sem autenticação). Anexar a ele?"
+                : "(exige autenticação). Anexar usando credenciais locais?"), { modal: true }, "Anexar", "Cancelar");
+        if (choice !== "Anexar") {
+            throw new Error(`anexação a ${baseUrl} recusada pelo usuário`);
+        }
+        if (kind === "open") {
+            // Servidor sem auth: anexa sem enviar nenhum segredo.
+            this.log.appendLine(`[server] conectado a servidor existente (sem auth) em ${baseUrl}`);
+            this.info = { baseUrl, authHeader: null, process: null, owned: false };
+            void this.pumpEvents();
+            return this.info;
+        }
+        // Servidor exige auth: tenta credenciais locais. `tryCredentials`
+        // primeiro verifica que ele rejeita senhas erradas (anti-coleta).
+        const servicePassword = readServicePassword();
+        const candidates = [
+            ...(process.env.OPENCODE_PASSWORD ? [process.env.OPENCODE_PASSWORD] : []),
+            ...(servicePassword ? [servicePassword] : []),
+        ];
+        for (const candidate of candidates) {
+            const result = await (0, security_1.tryCredentials)(baseUrl, (0, security_1.basicHeader)("opencode", candidate));
+            if (result.ok) {
+                this.log.appendLine(`[server] anexado com credencial local em ${baseUrl}`);
+                this.info = {
+                    baseUrl,
+                    authHeader: (0, security_1.basicHeader)("opencode", candidate),
+                    process: null,
+                    owned: false,
+                };
+                void this.pumpEvents();
+                return this.info;
+            }
+            this.log.appendLine(`[server] credencial local recusada (${result.reason})`);
+        }
+        throw new Error(`nenhuma credencial local aceita por ${baseUrl}`);
     }
     extractPort(args) {
         const i = args.findIndex((a) => a === "--port" || a === "-p");
@@ -140,31 +204,8 @@ class ServerManager {
         }
         return null;
     }
-    /** Testa se há um servidor na porta e se conseguimos autenticar. */
-    async probe(baseUrl) {
-        const candidates = [
-            process.env.OPENCODE_PASSWORD ? basicAuth("opencode", process.env.OPENCODE_PASSWORD) : null,
-            ...(readServicePassword() ? [basicAuth("opencode", readServicePassword())] : []),
-            null,
-        ];
-        for (const authHeader of candidates) {
-            try {
-                const res = await fetch(`${baseUrl}/api/session`, {
-                    headers: authHeader ? { Authorization: authHeader } : {},
-                    signal: AbortSignal.timeout(2500),
-                });
-                if (res.ok)
-                    return { ok: true, authHeader };
-            }
-            catch {
-                // serviço ausente nesta porta; segue
-                return { ok: false, authHeader: null };
-            }
-        }
-        return { ok: false, authHeader: null };
-    }
     async waitForReady(baseUrl, password, timeoutMs = 30_000) {
-        const authHeader = password ? basicAuth("opencode", password) : null;
+        const authHeader = password ? (0, security_1.basicHeader)("opencode", password) : null;
         const deadline = Date.now() + timeoutMs;
         let lastErr;
         let lastStatus = null;
@@ -230,7 +271,9 @@ class ServerManager {
         this.eventAbort?.abort();
         const abort = new AbortController();
         this.eventAbort = abort;
-        while (!abort.signal.aborted) {
+        // #6: o loop morre junto com o `info` (servidor encerrado), evitando
+        // reconexão infinita contra qualquer processo que ocupe a porta depois.
+        while (!abort.signal.aborted && this.info === info) {
             try {
                 const res = await fetch(`${info.baseUrl}/api/event`, {
                     headers: { Accept: "text/event-stream", ...this.authHeaders() },
@@ -241,7 +284,7 @@ class ServerManager {
                 await this.readSse(res.body, abort.signal);
             }
             catch (err) {
-                if (abort.signal.aborted)
+                if (abort.signal.aborted || this.info !== info)
                     return;
                 this.log.appendLine(`[sse] reconectando após: ${String(err)}`);
                 await new Promise((r) => setTimeout(r, 1000));
@@ -294,9 +337,6 @@ class ServerManager {
     }
 }
 exports.ServerManager = ServerManager;
-function basicAuth(user, password) {
-    return `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}`;
-}
 /** Gera uma senha aleatória para o servidor que esta extensão inicia. */
 function randomPassword() {
     return (0, node_crypto_1.randomBytes)(24).toString("base64url");

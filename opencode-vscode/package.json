@@ -2,9 +2,14 @@
   "name": "opencode-vscode",
   "displayName": "OpenCode for VS Code",
   "description": "OpenCode no VS Code: painel nativo (webview) conversando com o servidor OpenCode.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "local",
   "license": "MIT",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
   "repository": {
     "type": "git",
     "url": "https://example.invalid/opencode-vscode.git"
@@ -156,6 +161,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "test": "node test/security.test.js",
     "package": "npx @vscode/vsce package --no-dependencies"
   },
   "devDependencies": {

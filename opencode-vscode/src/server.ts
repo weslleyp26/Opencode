@@ -5,6 +5,13 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 import type { OutputChannel } from "vscode";
+import {
+  basicHeader,
+  probeUnauthenticated,
+  tryCredentials,
+  verifyServerEnforcesAuth,
+  validateCommandConfig,
+} from "./security";
 
 export interface ServerInfo {
   baseUrl: string;
@@ -29,6 +36,10 @@ export interface BusEvent {
  *   POST /api/session/:id/prompt {text}  -> 202-ish, assíncrono
  *   GET  /api/event                      -> text/event-stream (eventos do bus)
  *   auth: HTTP Basic (OPENCODE_PASSWORD / service.json)
+ *
+ * Segurança (#1): nunca envia credenciais a um servidor que não provou
+ * exigir autenticação; anexar a servidor existente exige confirmação
+ * explícita do usuário; após spawn próprio, verifica posse da porta.
  */
 export class ServerManager {
   private info: ServerInfo | null = null;
@@ -66,16 +77,25 @@ export class ServerManager {
       "--port",
       "4096",
     ]);
+
+    // #3: bloqueia command injection via config antes de qualquer spawn.
+    const cfgError = validateCommandConfig(command, args);
+    if (cfgError) {
+      this.log.appendLine(`[server] configuração rejeitada: ${cfgError}`);
+      throw new Error(`configuração do servidor rejeitada: ${cfgError}`);
+    }
+
     const port = this.extractPort(args) ?? 4096;
     const baseUrl = `http://127.0.0.1:${port}`;
 
-    // Se já há um servidor respondendo, apenas conecta (padrão "attach").
-    const existing = await this.probe(baseUrl);
-    if (existing.ok) {
-      this.log.appendLine(`[server] conectado a servidor existente em ${baseUrl}`);
-      this.info = { baseUrl, authHeader: existing.authHeader, process: null, owned: false };
-      void this.pumpEvents();
-      return this.info;
+    // #1: sonda ANÔNIMA. Um servidor que responde 200 sem autenticação pode
+    // ser um impostor coletor de credenciais; nunca enviamos senha a ele.
+    const probe = await probeUnauthenticated(baseUrl);
+    if (probe.kind === "open" || probe.kind === "auth-required") {
+      return await this.attachToExisting(baseUrl, probe.kind);
+    }
+    if (probe.kind === "other") {
+      throw new Error(`porta ${port} respondeu inesperadamente (HTTP ${probe.status})`);
     }
 
     const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -104,15 +124,83 @@ export class ServerManager {
     });
 
     await this.waitForReady(baseUrl, password);
+
+    // #1: verificação de posse — se outro processo tomou a porta antes do
+    // nosso filho binde, ele não exigirá auth => abortamos e matamos o filho.
+    const ownership = await verifyServerEnforcesAuth(
+      baseUrl,
+      basicHeader("opencode", password)
+    );
+    if (!ownership.owned) {
+      this.log.appendLine(`[server] posse da porta falhou: ${ownership.detail}`);
+      child.kill();
+      throw new Error(`servidor em ${baseUrl} não é confiável (${ownership.detail})`);
+    }
+
     this.info = {
       baseUrl,
-      authHeader: password ? basicAuth("opencode", password) : null,
+      authHeader: password ? basicHeader("opencode", password) : null,
       process: child,
       owned: true,
     };
     this.log.appendLine(`[server] pronto em ${baseUrl}`);
     void this.pumpEvents();
     return this.info;
+  }
+
+  /**
+   * Anexa a um servidor que já responde na porta. Exige confirmação
+   * explícita do usuário (#1) e só envia credenciais armazenadas quando
+   * o servidor demonstrou exigir autenticação.
+   */
+  private async attachToExisting(
+    baseUrl: string,
+    kind: "open" | "auth-required"
+  ): Promise<ServerInfo> {
+    const choice = await vscode.window.showWarningMessage(
+      `OpenCode: já existe um servidor respondendo em ${baseUrl} ` +
+        (kind === "open"
+          ? "(sem autenticação). Anexar a ele?"
+          : "(exige autenticação). Anexar usando credenciais locais?"),
+      { modal: true },
+      "Anexar",
+      "Cancelar"
+    );
+    if (choice !== "Anexar") {
+      throw new Error(`anexação a ${baseUrl} recusada pelo usuário`);
+    }
+
+    if (kind === "open") {
+      // Servidor sem auth: anexa sem enviar nenhum segredo.
+      this.log.appendLine(`[server] conectado a servidor existente (sem auth) em ${baseUrl}`);
+      this.info = { baseUrl, authHeader: null, process: null, owned: false };
+      void this.pumpEvents();
+      return this.info;
+    }
+
+    // Servidor exige auth: tenta credenciais locais. `tryCredentials`
+    // primeiro verifica que ele rejeita senhas erradas (anti-coleta).
+    const servicePassword = readServicePassword();
+    const candidates = [
+      ...(process.env.OPENCODE_PASSWORD ? [process.env.OPENCODE_PASSWORD] : []),
+      ...(servicePassword ? [servicePassword] : []),
+    ];
+    for (const candidate of candidates) {
+      const result = await tryCredentials(baseUrl, basicHeader("opencode", candidate));
+      if (result.ok) {
+        this.log.appendLine(`[server] anexado com credencial local em ${baseUrl}`);
+        this.info = {
+          baseUrl,
+          authHeader: basicHeader("opencode", candidate),
+          process: null,
+          owned: false,
+        };
+        void this.pumpEvents();
+        return this.info;
+      }
+      this.log.appendLine(`[server] credencial local recusada (${result.reason})`);
+    }
+    throw new Error(`nenhuma credencial local aceita por ${baseUrl}`);
   }
 
   private extractPort(args: string[]): number | null {
@@ -124,36 +212,12 @@ export class ServerManager {
     return null;
   }
 
-  /** Testa se há um servidor na porta e se conseguimos autenticar. */
-  private async probe(
-    baseUrl: string
-  ): Promise<{ ok: boolean; authHeader: string | null }> {
-    const candidates: Array<string | null> = [
-      process.env.OPENCODE_PASSWORD ? basicAuth("opencode", process.env.OPENCODE_PASSWORD) : null,
-      ...(readServicePassword() ? [basicAuth("opencode", readServicePassword()!)] : []),
-      null,
-    ];
-    for (const authHeader of candidates) {
-      try {
-        const res = await fetch(`${baseUrl}/api/session`, {
-          headers: authHeader ? { Authorization: authHeader } : {},
-          signal: AbortSignal.timeout(2500),
-        });
-        if (res.ok) return { ok: true, authHeader };
-      } catch {
-        // serviço ausente nesta porta; segue
-        return { ok: false, authHeader: null };
-      }
-    }
-    return { ok: false, authHeader: null };
-  }
-
   private async waitForReady(
     baseUrl: string,
     password: string,
     timeoutMs = 30_000
   ): Promise<void> {
-    const authHeader = password ? basicAuth("opencode", password) : null;
+    const authHeader = password ? basicHeader("opencode", password) : null;
     const deadline = Date.now() + timeoutMs;
     let lastErr: unknown;
     let lastStatus: number | null = null;
@@ -222,7 +286,9 @@ export class ServerManager {
     const abort = new AbortController();
     this.eventAbort = abort;
 
-    while (!abort.signal.aborted) {
+    // #6: o loop morre junto com o `info` (servidor encerrado), evitando
+    // reconexão infinita contra qualquer processo que ocupe a porta depois.
+    while (!abort.signal.aborted && this.info === info) {
       try {
         const res = await fetch(`${info.baseUrl}/api/event`, {
           headers: { Accept: "text/event-stream", ...this.authHeaders() },
@@ -231,7 +297,7 @@ export class ServerManager {
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
         await this.readSse(res.body, abort.signal);
       } catch (err) {
-        if (abort.signal.aborted) return;
+        if (abort.signal.aborted || this.info !== info) return;
         this.log.appendLine(`[sse] reconectando após: ${String(err)}`);
         await new Promise((r) => setTimeout(r, 1000));
       }
@@ -282,10 +348,6 @@ export class ServerManager {
     this.log.appendLine("[server] encerrando");
     proc.kill();
   }
-}
-
-function basicAuth(user: string, password: string): string {
-  return `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}`;
 }
 
 /** Gera uma senha aleatória para o servidor que esta extensão inicia. */

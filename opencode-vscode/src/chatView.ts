@@ -2,13 +2,12 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import type { BusEvent, ServerManager } from "./server";
-
-interface WebviewMessage {
-  type: "ready" | "send" | "newSession" | "abort" | "insertReference" | "openFile";
-  text?: string;
-  path?: string;
-  line?: number;
-}
+import {
+  isPathInsideWorkspace,
+  parseWebviewMessage,
+  randomNonce,
+  type WebviewMessage,
+} from "./security";
 
 /**
  * Provider do webview com streaming real.
@@ -22,6 +21,13 @@ interface WebviewMessage {
  * A UI fica em `media/webview.html` (separada do host, como Codex/Claude):
  * composer arredondado, `Enter` envia / `Shift+Enter` quebra linha,
  * mensagens em bolhas, markdown e tela de boas-vindas.
+ *
+ * Segurança:
+ *  #4 openFile confinado ao workspace (isPathInsideWorkspace);
+ *  #5 contexto do editor anunciado ao webview antes do envio;
+ *  #6 eventos sem sessionID ou de outra sessão são descartados;
+ *  #7 nonce criptográfico (via security.ts);
+ *  #8 toda mensagem da webview passa por parseWebviewMessage.
  */
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "opencode.chatView";
@@ -47,7 +53,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [this.context.extensionUri],
     };
     view.webview.html = this.html(view.webview);
-    view.webview.onDidReceiveMessage((m: WebviewMessage) => this.handle(m, view.webview));
+    this.disposables.push(
+      view.webview.onDidReceiveMessage((raw: unknown) => {
+        const m = parseWebviewMessage(raw);
+        if (m) void this.handle(m, view.webview);
+      })
+    );
     // Ao revelar o painel, devolve o foco ao campo de digitação (UX estilo Codex).
     this.disposables.push(
       view.onDidChangeVisibility(() => {
@@ -74,8 +85,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     this.panel = panel;
     panel.webview.html = this.html(panel.webview);
-    panel.webview.onDidReceiveMessage((m: WebviewMessage) =>
-      this.handle(m, panel.webview)
+    this.disposables.push(
+      panel.webview.onDidReceiveMessage((raw: unknown) => {
+        const m = parseWebviewMessage(raw);
+        if (m) void this.handle(m, panel.webview);
+      })
     );
     panel.onDidDispose(() => (this.panel = undefined));
   }
@@ -93,9 +107,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private onBusEvent(e: BusEvent): void {
     const data = e.data ?? {};
-    const sid = data.sessionID as string | undefined;
-    // Ignora eventos de outras sessões para não misturar conversas.
-    if (sid && this.sessionId && sid !== this.sessionId) return;
+    const sid = typeof data.sessionID === "string" ? data.sessionID : undefined;
+    // #6: filtra por sessão de forma estrita — eventos sem sessionID ou de
+    // outra sessão nunca são roteados para esta UI (evita bleed entre sessões
+    // quando conectado a um servidor compartilhado em modo attach).
+    if (!this.sessionId || sid !== this.sessionId) return;
 
     switch (e.type) {
       case "session.execution.started":
@@ -160,6 +176,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await vscode.commands.executeCommand("opencode.insertFileReference");
         break;
       case "openFile":
+        // #4: caminho já validado por parseWebviewMessage/isPathInsideWorkspace.
         await this.openFile(message.path, message.line);
         break;
     }
@@ -168,7 +185,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleSend(text: string, target: vscode.Webview): Promise<void> {
     const trimmed = text.trim();
     if (!trimmed) return;
-    const withContext = await this.withEditorContext(trimmed);
+
+    // #5: contexto do editor NÃO é anexado em silêncio — o webview recebe um
+    // aviso `context:attached` com o rótulo do que será incluído no prompt.
+    const { prompt: withContext, label } = await this.withEditorContext(trimmed);
+    target.postMessage({ type: "context:attached", label });
+
     try {
       if (!this.sessionId) {
         this.sessionId = await this.server.createSession(trimmed.slice(0, 60));
@@ -180,25 +202,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async openFile(path?: string, line?: number): Promise<void> {
-    if (!path) return;
+  private async openFile(relPath?: string, line?: number): Promise<void> {
+    if (!relPath) return;
+    // #4: defesa em profundidade — mesmo com validação na entrada, garante
+    // confinamento ao workspace antes de abrir o documento.
+    if (!isPathInsideWorkspace(relPath)) {
+      vscode.window.showWarningMessage(
+        "OpenCode: caminho fora do workspace bloqueado."
+      );
+      return;
+    }
     const root = vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!root) return;
-    const uri = vscode.Uri.joinPath(root, path);
+    const uri = vscode.Uri.joinPath(root, relPath);
     const doc = await vscode.workspace.openTextDocument(uri);
     const editor = await vscode.window.showTextDocument(doc);
     if (line) {
-      const pos = new vscode.Position(Math.max(0, line - 1), 0);
+      const pos = new vscode.Position(Math.max(0, Math.trunc(line) - 1), 0);
       editor.selection = new vscode.Selection(pos, pos);
       editor.revealRange(new vscode.Range(pos, pos));
     }
   }
 
-  /** Anexa arquivo aberto / seleção no formato `@arquivo#Lx-y`. */
-  private async withEditorContext(text: string): Promise<string> {
+  /**
+   * Anexa arquivo aberto / seleção no formato `@arquivo#Lx-y`.
+   * Retorna o prompt final E o rótulo do anexo (para exibição na UI, #5).
+   */
+  private async withEditorContext(
+    text: string
+  ): Promise<{ prompt: string; label: string | null }> {
     const cfg = vscode.workspace.getConfiguration("opencode");
     const editor = vscode.window.activeTextEditor;
-    if (!editor) return text;
+    if (!editor) return { prompt: text, label: null };
 
     const rel = vscode.workspace.asRelativePath(editor.document.uri);
     const sel = editor.selection;
@@ -208,15 +243,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (attachSelection && !sel.isEmpty) {
       const snippet = editor.document.getText(sel);
       const range = `#L${sel.start.line + 1}-${sel.end.line + 1}`;
-      return `@${rel}${range}\n\`\`\`\n${snippet}\n\`\`\`\n\n${text}`;
+      return {
+        prompt: `@${rel}${range}\n\`\`\`\n${snippet}\n\`\`\`\n\n${text}`,
+        label: `@${rel}${range}`,
+      };
     }
-    if (attachFile) return `@${rel}\n\n${text}`;
-    return text;
+    if (attachFile) return { prompt: `@${rel}\n\n${text}`, label: `@${rel}` };
+    return { prompt: text, label: null };
   }
 
   // ---------------------------------------------------------------- HTML
 
   private html(webview: vscode.Webview): string {
+    // #7: nonce vindo de crypto.randomBytes (security.ts).
     const nonce = randomNonce();
     const csp = [
       "default-src 'none'",
@@ -248,11 +287,4 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     return this.htmlTemplate;
   }
-}
-
-function randomNonce(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let out = "";
-  for (let i = 0; i < 32; i++) out += chars.charAt(Math.floor(Math.random() * chars.length));
-  return out;
 }

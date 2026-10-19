@@ -70,7 +70,14 @@ function activate(context) {
         await vscode.commands.executeCommand("type", { text: `@${rel}` });
     }), vscode.commands.registerCommand("opencode.showLogs", () => log.show(true)));
     const cfg = vscode.workspace.getConfiguration("opencode");
-    if (cfg.get("autoStartServer", true)) {
+    // #2: em um workspace não confiável ( Restricted Mode ), não inicie o
+    // servidor automaticamente — a config do projeto (opencode.json) pode
+    // conter plugins/comandos que executam código. O manifest também declara
+    // `capabilities.untrustedWorkspaces.supported: false`.
+    if (!vscode.workspace.isTrusted) {
+        log.appendLine("[ext] workspace não confiável — auto-start do servidor suprimido");
+    }
+    else if (cfg.get("autoStartServer", true)) {
         server
             .start()
             .then((info) => log.appendLine(`[ext] servidor pronto em ${info.baseUrl}`))

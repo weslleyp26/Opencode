@@ -132,6 +132,13 @@
     transition: border-color .15s;
   }
   #composer:focus-within { border-color: var(--vscode-focusBorder); }
+  /* badge de contexto anexado (#5) */
+  .ctx-badge {
+    display: block; font-size: .72em; opacity: .7; padding: 0 4px 4px;
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ctx-badge[hidden] { display: none; }
   #input {
     width: 100%; border: none; outline: none; resize: none; padding: 2px 4px;
     background: transparent; color: var(--vscode-input-foreground);
@@ -195,6 +202,7 @@
   </div>
 
   <div id="composer">
+    <div id="ctxBadge" class="ctx-badge" hidden></div>
     <textarea id="input" rows="1" placeholder="Pergunte ao OpenCode…"></textarea>
     <div class="toolbar">
       <button class="icon" id="ref" title="Inserir referência @arquivo (Ctrl+Alt+K)">@</button>
@@ -381,6 +389,20 @@
           sessionId = String(m.sessionId);
           updateStatus();
           break;
+        case 'context:attached': {
+          // #5: mostra ao usuário o que será anexado ao prompt (nada em silêncio).
+          const ctx = document.getElementById('ctxBadge');
+          if (ctx) {
+            if (m.label) {
+              ctx.textContent = 'anexando ' + String(m.label);
+              ctx.hidden = false;
+            } else {
+              ctx.hidden = true;
+              ctx.textContent = '';
+            }
+          }
+          break;
+        }
         case 'text:delta':
           if (!current) { current = startAssistant(); currentText = ''; }
           currentText += m.text ?? '';
