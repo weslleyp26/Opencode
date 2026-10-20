@@ -35,6 +35,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private panel?: vscode.WebviewPanel;
   private sessionId: string | null = null;
   private htmlTemplate?: string;
+  /** Janela de contexto do modelo padrão (cacheada; obtida do servidor). */
+  private contextLimit: number | null = null;
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(
@@ -125,7 +127,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Inicia uma nova sessão (a anterior continua no servidor, no histórico). */
   newSession(): void {
     this.sessionId = null;
+    this.contextLimit = null;
     this.post({ type: "session:new" });
+    // Zera a barra superior junto com a conversa.
+    this.post({ type: "usage", input: 0, output: 0, contextLimit: null });
   }
 
   dispose(): void {
@@ -133,6 +138,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // ------------------------------------------------------------- bus -> UI
+
+  /**
+   * Barra superior dinâmica: envia à webview o uso acumulado da sessão
+   * (tokens de input/output) e a janela de contexto do modelo, para o
+   * cálculo do percentual de contexto atual.
+   */
+  private async postUsage(): Promise<void> {
+    if (!this.sessionId) return;
+    const usage = await this.server.getSessionUsage(this.sessionId);
+    if (!usage) return;
+    if (this.contextLimit === null) {
+      this.contextLimit = await this.server.getModelContextLimit();
+    }
+    this.post({
+      type: "usage",
+      input: usage.input,
+      output: usage.output,
+      contextLimit: this.contextLimit,
+    });
+  }
 
   private onBusEvent(e: BusEvent): void {
     const data = e.data ?? {};
@@ -162,6 +187,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           cost: data.cost,
           finish: data.finish,
         });
+        // A barra superior mostra estado + tokens + % de contexto: repassa o
+        // uso ACUMULADO da sessão (GET /session/:id) junto com o passo.
+        void this.postUsage();
         break;
       case "session.execution.succeeded":
         this.post({ type: "exec:end", ok: true });
@@ -314,6 +342,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         sessionId: pick.sid,
         messages,
       });
+      // Restaura também a barra superior com o uso acumulado da sessão.
+      this.contextLimit = null;
+      void this.postUsage();
     } catch (err) {
       target.postMessage({ type: "error", text: String(err) });
     }
@@ -328,6 +359,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.sessionId = sessionId;
       const messages = await this.server.getMessages(sessionId);
       target.postMessage({ type: "session:restore", sessionId, messages });
+      this.contextLimit = null;
+      void this.postUsage();
     } catch (err) {
       target.postMessage({ type: "error", text: String(err) });
     }
@@ -346,8 +379,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!this.sessionId) {
         this.sessionId = await this.server.createSession(trimmed.slice(0, 60));
         target.postMessage({ type: "session:id", sessionId: this.sessionId });
+        this.contextLimit = null; // nova sessão: limite pode variar por modelo
       }
       await this.server.prompt(this.sessionId, withContext);
+      // Alimenta a barra superior (tokens + % de contexto) imediatamente.
+      void this.postUsage();
     } catch (err) {
       target.postMessage({ type: "error", text: String(err) });
     }

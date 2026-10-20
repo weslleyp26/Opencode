@@ -13,6 +13,7 @@ O OpenCode é um agente de IA que lê, escreve e executa código na sua máquina
 - **Um painel de chat na barra lateral** (ou em uma aba separada) onde você conversa com o agente
 - **Respostas em tempo real** — o texto aparece conforme o modelo gera, com indicador de "pensando"
 - **Contexto automático do editor** — o arquivo aberto ou o trecho selecionado são anexados à sua mensagem (você vê o que foi anexado)
+- **Barra de estado ao vivo** — acima do campo de mensagem: estado (`pensando…`), tokens de input/output da sessão e o percentual de contexto usado na janela do modelo
 - **Markdown completo** — negrito, listas, blocos de código, links e mais, renderizados de forma segura
 
 ## Por que instalar?
@@ -24,6 +25,7 @@ O OpenCode é um agente de IA que lê, escreve e executa código na sua máquina
 | **Referência rápida de arquivos** | Botão `@` (ou `Ctrl+Alt+K`) abre um seletor com os arquivos do workspace e insere `@arquivo` na mensagem |
 | **Interromper e voltar** | `Esc` (ou botão ■) para o agente na hora; `🕘` lista sessões anteriores e restaura a conversa |
 | **Contexto transparente** | A extensão mostra na UI exatamente o que será anexado (`@arquivo`, `@arquivo#L10-20`) — nada em silêncio |
+| **Consumo visível** | A barra superior mostra tokens de input/output e o percentual de contexto, para você saber quando compactar ou abrir uma nova sessão |
 | **Seguro por padrão** | CSP com nonce, comandos validados, servidor em `127.0.0.1` com senha aleatória, verificação de identidade do servidor (v0.1.2+) |
 | **Leve** | Zero dependências de runtime, UI HTML/CSS/JS pura, empacotamento mínimo (~24 KB) |
 
@@ -37,13 +39,13 @@ O OpenCode é um agente de IA que lê, escreve e executa código na sua máquina
 
 ### Opção 1 — Arquivo `.vsix` (mais simples)
 
-1. Baixe o arquivo `opencode-vscode-0.1.4.vsix`
+1. Baixe o arquivo `opencode-vscode-0.1.5.vsix`
 2. No VS Code: **Extensões** → `⋯` → **"Install from VSIX..."** → selecione o arquivo
 
 Ou pela linha de comando:
 
 ```powershell
-code --install-extension opencode-vscode-0.1.4.vsix
+code --install-extension opencode-vscode-0.1.5.vsix
 ```
 
 ### Opção 2 — Compilar a partir do código
@@ -53,7 +55,7 @@ cd opencode-vscode
 npm install
 npm run compile
 npm run package          # gera o .vsix
-code --install-extension opencode-vscode-0.1.4.vsix
+code --install-extension opencode-vscode-0.1.5.vsix
 ```
 
 ## Como usar
@@ -61,10 +63,11 @@ code --install-extension opencode-vscode-0.1.4.vsix
 1. **Abra o painel**: `Ctrl+Esc` ou clique no ícone OpenCode na barra lateral
 2. **Digite sua pergunta** e pressione `Enter` (use `Shift+Enter` para quebrar linha)
 3. **Acompanhe o agente**: o streaming mostra a resposta em tempo real; o raciocínio aparece em um bloco colapsável
-4. **Interrompa quando quiser**: pressione `Esc` no campo de mensagem (ou clique no botão ■) para abortar a execução no servidor
-5. **Anexe contexto**: clique em `@` para abrir o seletor de arquivos do workspace, ou selecione um trecho no editor — a extensão anexa automaticamente e mostra o aviso na UI
-6. **Nova sessão**: clique em `＋` para começar uma conversa do zero (a anterior continua disponível)
-7. **Volte a uma conversa**: clique em `🕘` para listar as sessões anteriores e restaurar o histórico completo
+4. **Veja o consumo**: a barra acima do campo de mensagem mostra `pensando…` durante a execução, os tokens de input/output da sessão (`↑`/`↓`) e o percentual de contexto usado na janela do modelo — a barrinha fica amarela a partir de 70% e vermelha a partir de 90%
+5. **Interrompa quando quiser**: pressione `Esc` no campo de mensagem (ou clique no botão ■) para abortar a execução no servidor
+6. **Anexe contexto**: clique em `@` para abrir o seletor de arquivos do workspace, ou selecione um trecho no editor — a extensão anexa automaticamente e mostra o aviso na barra de estado
+7. **Nova sessão**: clique em `＋` para começar uma conversa do zero (a anterior continua disponível)
+8. **Volte a uma conversa**: clique em `🕘` para listar as sessões anteriores e restaurar o histórico completo
 
 ### Atalhos
 
@@ -140,6 +143,8 @@ test/                testes de segurança (29 casos)
 | `POST` | `/api/session/:id/interrupt` | interrompe a execução da sessão → `{ interrupted }` |
 | `GET` | `/api/session` | lista as sessões (histórico) |
 | `GET` | `/api/session/:id/message` | mensagens da sessão (`type` + `content`), para restaurar a conversa |
+| `GET` | `/api/session/:id` | tokens acumulados da sessão (`tokens.input` / `tokens.output`) — barra de estado |
+| `GET` | `/api/model/default` | modelo padrão, incluindo `limit.context` (janela de contexto) — percentual na barra de estado |
 | `GET` | `/api/event` | stream SSE com o bus de eventos |
 
 Autenticação: HTTP Basic, usuário `opencode`. A senha vem de `OPENCODE_PASSWORD` ou é gerada aleatoriamente com `crypto.randomBytes(24)`.
@@ -151,7 +156,7 @@ session.execution.started   -> execução começa
 session.reasoning.delta     -> raciocínio incremental
 session.text.delta          -> texto incremental (streaming principal)
 session.text.ended          -> texto final
-session.step.ended          -> tokens/custo/finish
+session.step.ended          -> tokens/custo/finish (dispara a atualização da barra de estado)
 session.execution.succeeded -> fim
 session.execution.aborted   -> interrompido pelo usuário (Esc/■)
 ```
@@ -161,6 +166,7 @@ session.execution.aborted   -> interrompido pelo usuário (Esc/■)
 - [x] Suporte a abortar sessão pelo servidor (botão ■ / `Esc`)
 - [x] Histórico de sessões com restauração da conversa (`🕘`)
 - [x] Seletor de arquivos no botão `@`
+- [x] Barra de estado ao vivo (pensando, tokens de input/output e % de contexto)
 - [ ] Seletor de modelo na UI
 - [ ] Exibição de diffs no chat
 - [ ] Suporte a múltiplos workspaces

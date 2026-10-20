@@ -359,6 +359,49 @@ class ServerManager {
         }
         return out;
     }
+    /**
+     * Tokens acumulados da sessão (custo da conversa inteira).
+     * Contrato v2 verificado ao vivo: GET /session/:id -> { data: { tokens } }.
+     */
+    async getSessionUsage(sessionId) {
+        try {
+            const info = await this.start();
+            const res = await fetch(`${info.baseUrl}/api/session/${sessionId}`, {
+                headers: this.authHeaders(),
+            });
+            if (!res.ok)
+                return null;
+            const body = (await res.json());
+            const t = body.data?.tokens;
+            if (!t)
+                return null;
+            return { input: t.input ?? 0, output: t.output ?? 0 };
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * Janela de contexto do modelo padrão, para o percentual de contexto.
+     * Contrato v2 verificado ao vivo:
+     *   GET /model/default -> { data: { limit: { context } } }.
+     */
+    async getModelContextLimit() {
+        try {
+            const info = await this.start();
+            const res = await fetch(`${info.baseUrl}/api/model/default`, {
+                headers: this.authHeaders(),
+            });
+            if (!res.ok)
+                return null;
+            const body = (await res.json());
+            const limit = body.data?.limit?.context;
+            return typeof limit === "number" && limit > 0 ? limit : null;
+        }
+        catch {
+            return null;
+        }
+    }
     /** Envia um prompt. O retorno é imediato; o texto vem pelo SSE. */
     async prompt(sessionId, text) {
         const info = await this.start();

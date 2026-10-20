@@ -132,13 +132,32 @@
     transition: border-color .15s;
   }
   #composer:focus-within { border-color: var(--vscode-focusBorder); }
-  /* badge de contexto anexado (#5) */
-  .ctx-badge {
-    display: block; font-size: .72em; opacity: .7; padding: 0 4px 4px;
+  /* barra superior do composer: estado dinâmico (#5 + status) */
+  .status-strip {
+    display: flex; align-items: center; gap: 8px;
+    font-size: .72em; padding: 0 4px 4px;
     color: var(--vscode-descriptionForeground);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; overflow: hidden;
   }
-  .ctx-badge[hidden] { display: none; }
+  .status-strip[hidden] { display: none; }
+  .status-strip .seg { display: inline-flex; align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis; }
+  .status-strip .seg.ctx-label { color: var(--vscode-textLink-foreground); }
+  .status-strip .spin {
+    width: 8px; height: 8px; border-radius: 50%;
+    border: 1.5px solid currentColor; border-top-color: transparent;
+    animation: rot .8s linear infinite; flex: none;
+  }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  .status-strip .meter {
+    display: inline-block; width: 42px; height: 4px; border-radius: 2px;
+    background: rgba(128,128,128,.3); overflow: hidden; flex: none;
+  }
+  .status-strip .meter i {
+    display: block; height: 100%; border-radius: 2px;
+    background: var(--vscode-charts-green, #3fb950); transition: width .3s;
+  }
+  .status-strip .meter i.warn { background: var(--vscode-charts-yellow, #e0a100); }
+  .status-strip .meter i.crit { background: var(--vscode-errorForeground); }
   #input {
     width: 100%; border: none; outline: none; resize: none; padding: 2px 4px;
     background: transparent; color: var(--vscode-input-foreground);
@@ -208,7 +227,14 @@
   </div>
 
   <div id="composer">
-    <div id="ctxBadge" class="ctx-badge" hidden></div>
+    <div id="statusStrip" class="status-strip" hidden>
+      <span class="seg ctx-label" id="segAttached" hidden></span>
+      <span class="seg" id="segState" hidden><span class="spin"></span><span>pensando…</span></span>
+      <span class="seg" id="segTokens" hidden title="tokens de input / output da sessão"></span>
+      <span class="seg" id="segCtx" hidden title="percentual de contexto usado na janela do modelo">
+        <span class="meter"><i id="ctxBar" style="width:0%"></i></span><span id="ctxPct"></span>
+      </span>
+    </div>
     <textarea id="input" rows="1" placeholder="Pergunte ao OpenCode…"></textarea>
     <div class="toolbar">
       <button class="icon" id="ref" title="Anexar arquivo com @ (abre o seletor de arquivos)">@</button>
@@ -240,6 +266,37 @@
     let online = null;
     let sessionId = null;
     let busy = false;          // execução em andamento (mostra o botão parar/ESC)
+    // barra superior dinâmica (estado + tokens + % de contexto)
+    const segAttached = document.getElementById('segAttached');
+    const segState = document.getElementById('segState');
+    const segTokens = document.getElementById('segTokens');
+    const segCtx = document.getElementById('segCtx');
+    const ctxBar = document.getElementById('ctxBar');
+    const ctxPct = document.getElementById('ctxPct');
+    let usageInput = 0;
+    let usageOutput = 0;
+    let contextLimit = null;
+
+    const fmtTokens = (n) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
+
+    function updateStrip() {
+      const strip = document.getElementById('statusStrip');
+      segState.hidden = !busy;
+      segTokens.hidden = !(usageInput || usageOutput);
+      if (!segTokens.hidden) {
+        segTokens.textContent = '↑' + fmtTokens(usageInput) + ' ↓' + fmtTokens(usageOutput);
+      }
+      // % de contexto = tokens de input (inclui cache) / janela do modelo
+      const hasCtx = contextLimit != null && usageInput > 0;
+      segCtx.hidden = !hasCtx;
+      if (hasCtx) {
+        const pct = Math.min(100, Math.round((usageInput / contextLimit) * 100));
+        ctxPct.textContent = pct + '%';
+        ctxBar.style.width = pct + '%';
+        ctxBar.className = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : '';
+      }
+      strip.hidden = segAttached.hidden && segState.hidden && segTokens.hidden && segCtx.hidden;
+    }
 
     // --------------------------------------------------------- markdown
     const esc = (s) => s.replace(/[&<>"']/g, (c) => (
@@ -335,11 +392,15 @@
       welcome.hidden = false;
       thinking.classList.remove('on');
       pinned = true; log.scrollTop = 0;
+      segAttached.hidden = true; segAttached.textContent = '';
+      usageInput = 0; usageOutput = 0;
+      updateStrip();
     }
     function updateStatus() {
       dot.className = 'dot' + (online === true ? ' on' : online === false ? ' off' : '');
       statusText.textContent = online === true ? 'online' : online === false ? 'offline' : 'conectando…';
       statusEl.title = sessionId ? 'sessão ' + sessionId : 'servidor OpenCode';
+      updateStrip();
     }
 
     // ----------------------------------------------------------- composer
@@ -359,6 +420,7 @@
     function setBusy(value) {
       busy = !!value;
       updateSendButton();
+      updateStrip();
     }
 
     const resize = () => {
@@ -436,16 +498,15 @@
           break;
         case 'context:attached': {
           // #5: mostra ao usuário o que será anexado ao prompt (nada em silêncio).
-          const ctx = document.getElementById('ctxBadge');
-          if (ctx) {
-            if (m.label) {
-              ctx.textContent = 'anexando ' + String(m.label);
-              ctx.hidden = false;
-            } else {
-              ctx.hidden = true;
-              ctx.textContent = '';
-            }
+          // Agora o aviso vive na barra superior, que também exibe estado/tokens.
+          if (m.label) {
+            segAttached.textContent = 'anexando ' + String(m.label);
+            segAttached.hidden = false;
+          } else {
+            segAttached.hidden = true;
+            segAttached.textContent = '';
           }
+          updateStrip();
           break;
         }
         case 'reference:insert': {
@@ -508,12 +569,23 @@
         }
         case 'exec:start':
           setBusy(true);
+          // A anexação já foi enviada: a barra volta a mostrar estado/tokens.
+          segAttached.hidden = true;
+          segAttached.textContent = '';
           thinking.classList.add('on');
+          updateStrip();
           autoScroll();
           break;
         case 'exec:end':
           setBusy(false);
           thinking.classList.remove('on');
+          break;
+        case 'usage':
+          // Tokens acumulados da sessão + janela de contexto do modelo.
+          usageInput = Number(m.input) || 0;
+          usageOutput = Number(m.output) || 0;
+          contextLimit = typeof m.contextLimit === 'number' ? m.contextLimit : null;
+          updateStrip();
           break;
         case 'error':
           setBusy(false);
@@ -554,6 +626,7 @@
 
     updateStatus();
     resize();
+    updateStrip();
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>
