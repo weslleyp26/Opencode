@@ -7,3 +7,7 @@ peft>=0.13
 trl>=0.12
 bitsandbytes>=0.44
 accelerate>=1.0
+
+# Opcional: conversao safetensors -> GGUF (usado pelo build_ollama.ps1)
+gguf>=0.10
+sentencepiece>=0.2

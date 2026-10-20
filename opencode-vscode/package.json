@@ -12,7 +12,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://example.invalid/opencode-vscode.git"
+    "url": "https://github.com/weslleyp26/Opencode.git"
+  },
+  "homepage": "https://github.com/weslleyp26/Opencode#readme",
+  "bugs": {
+    "url": "https://github.com/weslleyp26/Opencode/issues"
   },
   "engines": {
     "vscode": "^1.94.0",

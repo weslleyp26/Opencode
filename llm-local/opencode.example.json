@@ -1,20 +1,11 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "provider": {
+  "providers": {
     "ollama": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Ollama (local)",
-      "options": {
-        "baseURL": "http://localhost:11434/v1"
-      },
-      "models": {
-        "llm-local-coder": {
-          "name": "LLM Local Coder 1.5B (fine-tuned)"
-        },
-        "qwen2.5-coder:1.5b": {
-          "name": "Qwen2.5 Coder 1.5B (base)"
-        }
+      "settings": {
+        "baseURL": "http://127.0.0.1:11434/v1"
       }
     }
-  }
+  },
+  "update": "disable"
 }

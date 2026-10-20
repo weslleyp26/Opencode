@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum", type=int, default=8)
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--out", default=str(OUT_DIR))
+    p.add_argument(
+        "--drop-long",
+        action="store_true",
+        help="descarta exemplos maiores que --seq em vez de truncar",
+    )
     return p.parse_args()
 
 
@@ -126,6 +131,17 @@ def main() -> None:
         remove_columns=ds.column_names,
         desc="Formatando com chat template",
     )
+
+    if args.drop_long:
+        # Truncar no meio do codigo ensina o modelo a parar no meio. Melhor
+        # descartar o exemplo inteiro.
+        def cabe(r):
+            return len(tokenizer(r["text"], add_special_tokens=False)["input_ids"]) <= args.seq
+
+        antes = len(ds)
+        ds = ds.filter(cabe, desc="Removendo exemplos acima de --seq")
+        print(f"Exemplos acima de {args.seq} tokens removidos: {antes - len(ds)}")
+
     print(f"{len(ds)} exemplos carregados de {data_path}")
     print("--- exemplo ---")
     print(ds[0]["text"][:600])
